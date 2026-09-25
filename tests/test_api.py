@@ -2763,6 +2763,258 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(fetched["fx"], body["fx"])
         self.assertTrue(fetched["recompute_matched"])
 
+    BIG_NET = "100000000000000000000000000000.00"      # 30 位整数 + 2 位小数
+    BIG_GROSS = "110000000000000000000000000000.00"    # 10% 税后的含税总额
+    BIG_GROSS_LESS_CENT = "109999999999999999999999999999.99"
+
+    def _make_huge_invoice(self, due_date: str | None = None) -> int:
+        payload = {
+            "currency": "USD",
+            "lines": [{"net": self.BIG_NET, "tax_rate": "0.10"}],
+        }
+        if due_date is not None:
+            payload["due_date"] = due_date
+        status, inv = self._request("POST", "/api/v1/invoices", payload)
+        self.assertEqual(status, 201, inv)
+        self.assertEqual(inv["totals"]["total_gross"], self.BIG_GROSS)
+        return inv["id"]
+
+    def _find_overdue(self, invoice_id: int, as_of: str) -> dict | None:
+        page = 1
+        while True:
+            status, body = self._request(
+                "GET",
+                f"/api/v1/invoices/overdue?as_of={as_of}&page={page}&page_size=100",
+            )
+            self.assertEqual(status, 200, body)
+            for item in body["items"]:
+                if item["id"] == invoice_id:
+                    return item
+            if page >= body["pages"]:
+                return None
+            page += 1
+
+    def test_44_huge_invoice_payment_precision(self) -> None:
+        # 30 位整数 USD 发票：登记 0.01 后未收余额不丢分位；登记大额收款不再
+        # 抛 InvalidOperation；收款响应、查询、快照与逾期查询的余额口径一致
+        invoice_id = self._make_huge_invoice(due_date="2020-01-01")
+
+        # 登记 0.01：未收余额必须精确到分位（默认 28 位精度下曾丢失 .99）
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "0.01"}
+        )
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["amount"], "0.01")
+        self.assertEqual(pay["paid_total"], "0.01")
+        self.assertEqual(pay["outstanding"], self.BIG_GROSS_LESS_CENT)
+
+        # 大额但非最小单位整数倍的金额 -> 422（不得抛 500）
+        status, body = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": "110000000000000000000000000000.001"},
+        )
+        self.assertEqual(status, 422, body)
+
+        # 查询口径与收款响应一致
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["paid_total"], "0.01")
+        self.assertEqual(ov["outstanding"], self.BIG_GROSS_LESS_CENT)
+
+        # 历史快照同一口径
+        at = "2099-01-01T00:00:00Z"
+        status, snap = self._request(
+            "GET",
+            f"/api/v1/invoices/{invoice_id}/payment-snapshot"
+            f"?at={urllib.parse.quote(at, safe='')}",
+        )
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["total_gross"], self.BIG_GROSS)
+        self.assertEqual(snap["received_total"], "0.01")
+        self.assertEqual(snap["net_paid"], "0.01")
+        self.assertEqual(snap["outstanding"], self.BIG_GROSS_LESS_CENT)
+
+        # 逾期查询同一口径
+        item = self._find_overdue(invoice_id, "2030-01-01")
+        self.assertIsNotNone(item)
+        self.assertEqual(item["total_gross"], self.BIG_GROSS)
+        self.assertEqual(item["paid_total"], "0.01")
+        self.assertEqual(item["outstanding"], self.BIG_GROSS_LESS_CENT)
+
+        # 登记剩余大额收款（此前会抛 InvalidOperation）：恰好收满
+        status, pay = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": self.BIG_GROSS_LESS_CENT},
+        )
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["amount"], self.BIG_GROSS_LESS_CENT)
+        self.assertEqual(pay["paid_total"], self.BIG_GROSS)
+        self.assertEqual(pay["outstanding"], "0.00")
+
+        # 收满后超收 0.01 -> 422，且不留下任何流水
+        status, body = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "0.01"}
+        )
+        self.assertEqual(status, 422, body)
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(ov["payment_count"], 2)
+        self.assertEqual(ov["paid_total"], self.BIG_GROSS)
+        self.assertEqual(ov["outstanding"], "0.00")
+
+        # 逾期列表中消失（已收满）
+        self.assertIsNone(self._find_overdue(invoice_id, "2030-01-01"))
+
+        # 0 位小数币种（JPY）的大额发票同样精确
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "JPY",
+                "lines": [{"net": "100000000000000000000000000000", "tax_rate": "0.10"}],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        jpy_id = inv["id"]
+        self.assertEqual(inv["totals"]["total_gross"], "110000000000000000000000000000")
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{jpy_id}/payments", {"amount": "1"}
+        )
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["outstanding"], "109999999999999999999999999999")
+        status, ov = self._request("GET", f"/api/v1/invoices/{jpy_id}/payments")
+        self.assertEqual(ov["outstanding"], "109999999999999999999999999999")
+
+    def test_45_huge_payment_reversal_precision(self) -> None:
+        # 大额收款分次冲销：净入账额精确到分位；超冲 422 且不留流水
+        invoice_id = self._make_huge_invoice()
+        status, pay = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/payments",
+            {"amount": self.BIG_GROSS},
+        )
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["outstanding"], "0.00")
+        payment_id = pay["id"]
+
+        # 先冲 0.01：净入账额 = 总额 - 0.01，分位不丢
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{payment_id}/reversals", {"amount": "0.01"}
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["reversed_total"], "0.01")
+        self.assertEqual(rev["net_amount"], self.BIG_GROSS_LESS_CENT)
+
+        # 再冲剩余大额：恰好冲完
+        status, rev = self._request(
+            "POST",
+            f"/api/v1/payments/{payment_id}/reversals",
+            {"amount": self.BIG_GROSS_LESS_CENT},
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["reversed_total"], self.BIG_GROSS)
+        self.assertEqual(rev["net_amount"], "0.00")
+
+        # 超冲 0.01 -> 422，且不留下任何冲销流水
+        status, body = self._request(
+            "POST", f"/api/v1/payments/{payment_id}/reversals", {"amount": "0.01"}
+        )
+        self.assertEqual(status, 422, body)
+
+        # 未收余额精确回升到含税总额，各查询口径一致
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(ov["payment_count"], 1)
+        self.assertEqual(ov["paid_total"], "0.00")
+        self.assertEqual(ov["reversed_total"], self.BIG_GROSS)
+        self.assertEqual(ov["outstanding"], self.BIG_GROSS)
+        self.assertEqual(ov["payments"][0]["net_amount"], "0.00")
+
+        at = "2099-01-01T00:00:00Z"
+        status, snap = self._request(
+            "GET",
+            f"/api/v1/invoices/{invoice_id}/payment-snapshot"
+            f"?at={urllib.parse.quote(at, safe='')}",
+        )
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["received_total"], self.BIG_GROSS)
+        self.assertEqual(snap["reversed_total"], self.BIG_GROSS)
+        self.assertEqual(snap["net_paid"], "0.00")
+        self.assertEqual(snap["outstanding"], self.BIG_GROSS)
+
+    def test_46_huge_allocation_and_batch_reversal(self) -> None:
+        # 大额来款跨两张大额发票分配、按批次整批撤销：金额全程精确
+        id_a = self._make_huge_invoice(due_date="2026-01-01")
+        id_b = self._make_huge_invoice(due_date="2026-02-01")
+
+        # 来款 = A 全额 + B 的 0.01（入参顺序打乱，仍按到期日顺序抵扣）
+        amount = "110000000000000000000000000000.01"
+        status, res = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": amount, "invoice_ids": [id_b, id_a]},
+        )
+        self.assertEqual(status, 201, res)
+        self.assertEqual(res["allocated_total"], amount)
+        by_invoice = {it["invoice_id"]: it for it in res["allocations"]}
+        self.assertEqual(by_invoice[id_a]["allocated"], self.BIG_GROSS)
+        self.assertEqual(by_invoice[id_a]["outstanding"], "0.00")
+        self.assertEqual(by_invoice[id_b]["allocated"], "0.01")
+        self.assertEqual(by_invoice[id_b]["outstanding"], self.BIG_GROSS_LESS_CENT)
+
+        # B 的剩余未收（总额 − 0.01）可以恰好分完；再超出的来款 -> 422 整笔拒绝
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {
+                "currency": "USD",
+                "amount": self.BIG_GROSS_LESS_CENT,
+                "invoice_ids": [id_b],
+            },
+        )
+        self.assertEqual(status, 201, body)
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {
+                "currency": "USD",
+                "amount": "0.01",
+                "invoice_ids": [id_b],
+            },
+        )
+        self.assertEqual(status, 422, body)
+        # 整笔拒绝不留流水：B 仍只有前两批各一条收款
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_b}/payments")
+        self.assertEqual(ov["payment_count"], 2)
+        self.assertEqual(ov["paid_total"], self.BIG_GROSS)
+        self.assertEqual(ov["outstanding"], "0.00")
+
+        # 整批撤销第一个批次：逐笔净入账额精确冲销
+        status, rev = self._request(
+            "POST",
+            f"/api/v1/payment-allocation-batches/{res['batch_id']}/reversals",
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["reversed_total"], amount)
+        for item in rev["items"]:
+            self.assertEqual(item["net_amount"], "0.00")
+        by_invoice = {it["invoice_id"]: it for it in rev["items"]}
+        self.assertEqual(by_invoice[id_a]["reversed_amount"], self.BIG_GROSS)
+        self.assertEqual(by_invoice[id_b]["reversed_amount"], "0.01")
+
+        # 幂等：重复请求 200，内容恒定
+        status, rev2 = self._request(
+            "POST",
+            f"/api/v1/payment-allocation-batches/{res['batch_id']}/reversals",
+        )
+        self.assertEqual(status, 200, rev2)
+        self.assertEqual(rev2, rev)
+
+        # 撤销后 A 的未收余额精确回升
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_a}/payments")
+        self.assertEqual(ov["paid_total"], "0.00")
+        self.assertEqual(ov["outstanding"], self.BIG_GROSS)
+
 
 if __name__ == "__main__":
     unittest.main()

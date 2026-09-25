@@ -58,7 +58,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.11.0",
+    version="1.11.1",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -74,6 +74,8 @@ app = FastAPI(
         "应收账龄汇总（查询日 UTC 结束时点、按币种分桶、不跨币种相加）、"
         "期间税额归集（UTC 自然日闭区间，原币种 + 原发票行税率分组，"
         "分别累计开票、贷项抵减与净额，不使用目标币换算列）、"
+        "所有金额累计与量化统一在按金额量级自动放大的局部精度内进行"
+        "（超大金额发票的收款/冲销/余额精确到币种最小单位）、"
         "SQLite 持久化。"
     ),
     lifespan=lifespan,

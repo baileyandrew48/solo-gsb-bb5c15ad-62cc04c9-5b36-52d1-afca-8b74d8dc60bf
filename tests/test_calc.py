@@ -9,11 +9,30 @@ import threading
 import unittest
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 
-from app.calc import RULE_ID, compute_invoice, recompute_matches
+from app.calc import RULE_ID, compute_invoice, money_context, money_prec, recompute_matches
 
 
 def line(net: str, rate: str, desc: str | None = None) -> dict:
     return {"net": net, "tax_rate": rate, "description": desc}
+
+
+def run_in_fresh_thread(fn):
+    """在全新线程（Decimal 上下文为默认 28 位精度）中执行 fn。"""
+
+    box: dict = {}
+
+    def runner() -> None:
+        try:
+            box["result"] = fn()
+        except Exception as exc:  # 测试需要把异常带回主线程断言
+            box["error"] = exc
+
+    t = threading.Thread(target=runner)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
 
 
 class RoundingAndResidualTests(unittest.TestCase):
@@ -233,20 +252,7 @@ class LocalPrecisionTests(unittest.TestCase):
     def _run_in_fresh_thread(self, fn):
         """在全新线程（Decimal 上下文为默认 28 位精度）中执行 fn。"""
 
-        box: dict = {}
-
-        def runner() -> None:
-            try:
-                box["result"] = fn()
-            except Exception as exc:  # 测试需要把异常带回主线程断言
-                box["error"] = exc
-
-        t = threading.Thread(target=runner)
-        t.start()
-        t.join()
-        if "error" in box:
-            raise box["error"]
-        return box["result"]
+        return run_in_fresh_thread(fn)
 
     def test_non_minor_unit_huge_net_rejected_in_worker_thread(self):
         # 26 位整数 + 3 位小数：28 位默认精度下 net/unit 的除法会把 .001 舍没，
@@ -318,6 +324,52 @@ class LocalPrecisionTests(unittest.TestCase):
         r_main = compute_invoice(payload)
         r_worker = self._run_in_fresh_thread(lambda: compute_invoice(payload))
         self.assertEqual(r_main, r_worker)
+
+
+class MoneyContextTests(unittest.TestCase):
+    """收支累计的局部精度策略（与 compute_invoice 的 _sufficient_prec 同源）。
+
+    收款/冲销/余额的累计与量化在 money_context 内进行：默认 28 位精度的线程下，
+    大额金额（如 30 位整数净额发票）的余额不丢分位、大额量化不抛 InvalidOperation。
+    """
+
+    BIG_GROSS = "110000000000000000000000000000.00"  # 32 位有效数字
+    BIG_LESS_CENT = "109999999999999999999999999999.99"
+
+    def test_huge_balance_keeps_cents_in_worker_thread(self):
+        # 默认 28 位精度下 gross - 0.01 曾丢分位、大额 quantize 曾抛 InvalidOperation
+        def work():
+            gross = Decimal(self.BIG_GROSS)
+            with money_context([gross, Decimal("0.01")]):
+                outstanding = gross - Decimal("0.01")
+                quantized = Decimal(self.BIG_LESS_CENT).quantize(Decimal("0.01"))
+            return format(outstanding, "f"), format(quantized, "f")
+
+        outstanding, quantized = run_in_fresh_thread(work)
+        self.assertEqual(outstanding, self.BIG_LESS_CENT)
+        self.assertEqual(quantized, self.BIG_LESS_CENT)
+
+    def test_huge_sum_carry_in_worker_thread(self):
+        # 多笔大额累计的进位同样精确（count 预留 log10(n) 进位）
+        amounts = [Decimal(self.BIG_GROSS)] * 10
+        with money_context(amounts, len(amounts)):
+            total = sum(amounts, Decimal("0"))
+        self.assertEqual(format(total, "f"), "1100000000000000000000000000000.00")
+
+    def test_prec_scales_with_magnitude(self):
+        # 常规金额维持 50 位基准；大额金额自动放大
+        self.assertEqual(money_prec([Decimal("1.00")]), 50)
+        self.assertGreater(money_prec([Decimal(self.BIG_GROSS)]), 50)
+        self.assertEqual(money_prec([]), 50)
+
+    def test_context_restores_default_precision(self):
+        # 不读不写全局/线程上下文：退出后恢复默认 28 位
+        import decimal
+
+        before = decimal.getcontext().prec
+        with money_context([Decimal(self.BIG_GROSS)]):
+            self.assertGreater(decimal.getcontext().prec, before)
+        self.assertEqual(decimal.getcontext().prec, before)
 
 
 if __name__ == "__main__":

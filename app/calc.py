@@ -29,6 +29,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any, Iterable
@@ -251,6 +253,36 @@ def _sufficient_prec(
         except ValueError:
             pass
     return max(_BASE_PREC, 6 * span + len(str(n_lines)) + 16)
+
+
+def money_prec(amounts: Iterable[Decimal], count: int = 1) -> int:
+    """按一批金额的实际量级计算「足够」的局部精度（与 :func:`_sufficient_prec` 同一策略）。
+
+    用于收款/冲销/余额等收支累计与量化场景：常规金额维持 ``_BASE_PREC``；金额
+    完整展开位数（:func:`_decimal_span`，整数位 + 小数位）更大时自动放大——
+    预留累计求和的进位（log10(count)）与乘除中间结果（如贷项凭证按累计净额
+    比例摊算税额）的余量，保证任何线程（含默认 28 位精度的 FastAPI 工作线程）
+    下加减、比较与 ``quantize`` 都精确：大额发票（如 30 位整数净额）的余额
+    不丢分位，大额金额量化不抛 ``InvalidOperation``。
+    """
+
+    span = 1
+    for amount in amounts:
+        span = max(span, _decimal_span(amount))
+    return max(_BASE_PREC, 4 * span + len(str(max(count, 1))) + 16)
+
+
+@contextmanager
+def money_context(amounts: Iterable[Decimal], count: int = 1) -> Iterator[None]:
+    """进入按本次涉及金额量级计算的局部精度上下文（策略见 :func:`money_prec`）。
+
+    Decimal 上下文是线程本地的，模块级全局设置管不到工作线程；收款登记、
+    冲销、余额累计与量化等所有金额运算都必须放进该上下文，任何线程下结果一致。
+    """
+
+    with localcontext() as ctx:
+        ctx.prec = money_prec(amounts, count)
+        yield
 
 
 def compute_invoice(payload: dict[str, Any]) -> dict[str, Any]:
