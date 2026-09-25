@@ -17,6 +17,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import uvicorn
@@ -2762,6 +2763,175 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(fetched["fx"], body["fx"])
         self.assertTrue(fetched["recompute_matched"])
+
+    def test_44_huge_invoice_payment_precision(self) -> None:
+        # 30 位整数净额的 USD 发票（total_gross 有 33 位整数）：FastAPI 工作
+        # 线程默认 Decimal 28 位精度下，登记 0.01 后未收余额不得丢分位，登记
+        # 大额收款不得抛 InvalidOperation；收款响应/查询/快照口径必须一致。
+        gross = "110000000000000000000000000000.00"
+        rest_after_cent = "109999999999999999999999999999.99"
+        payload = {
+            "currency": "USD",
+            "due_date": "2026-09-01",
+            "lines": [{"net": "100000000000000000000000000000.00", "tax_rate": "0.10"}],
+        }
+        status, inv = self._request("POST", "/api/v1/invoices", payload)
+        self.assertEqual(status, 201, inv)
+        self.assertEqual(inv["totals"]["total_gross"], gross)
+        invoice_id = inv["id"]
+        pay_path = f"/api/v1/invoices/{invoice_id}/payments"
+
+        # 初始未收即含税总额
+        status, ov = self._request("GET", pay_path)
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["outstanding"], gross)
+        self.assertEqual(ov["paid_total"], "0.00")
+
+        # 登记 0.01：响应与查询的未收余额都必须保留分位
+        status, pay = self._request("POST", pay_path, {"amount": "0.01"})
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["amount"], "0.01")
+        self.assertEqual(pay["paid_total"], "0.01")
+        self.assertEqual(pay["outstanding"], rest_after_cent)
+
+        status, ov = self._request("GET", pay_path)
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["paid_total"], "0.01")
+        self.assertEqual(ov["outstanding"], rest_after_cent)
+        self.assertEqual(ov["payments"][0]["net_amount"], "0.01")
+
+        # 再登记大额收款（含税总额 − 0.02），不抛 500/InvalidOperation，余 0.01
+        big_pay = "109999999999999999999999999999.98"
+        status, pay = self._request("POST", pay_path, {"amount": big_pay})
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["amount"], big_pay)
+        self.assertEqual(pay["outstanding"], "0.01")
+        self.assertEqual(
+            pay["paid_total"], "109999999999999999999999999999.99"
+        )
+
+        # 超收 0.02 -> 422，原写事务回滚，不留流水
+        before_count = ov["payment_count"]
+        status, body = self._request("POST", pay_path, {"amount": "0.02"})
+        self.assertEqual(status, 422, body)
+        status, ov = self._request("GET", pay_path)
+        self.assertEqual(ov["payment_count"], before_count + 1)
+        self.assertEqual(ov["outstanding"], "0.01")
+
+        # 收满最后 0.01
+        status, pay = self._request("POST", pay_path, {"amount": "0.01"})
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["outstanding"], "0.00")
+        # 已收满再收 -> 422 不留流水
+        status, _ = self._request("POST", pay_path, {"amount": "0.01"})
+        self.assertEqual(status, 422)
+
+        # 小于最小单位的大额金额（26 位整数 + .001）必须在 28 位线程下拒绝，
+        # 不能因精度不足被误判为合法倍数
+        payload2 = {
+            "currency": "USD",
+            "lines": [{"net": "100000000000000000000000000000.00", "tax_rate": "0.10"}],
+        }
+        status, inv2 = self._request("POST", "/api/v1/invoices", payload2)
+        self.assertEqual(status, 201, inv2)
+        status, body = self._request(
+            "POST", f"/api/v1/invoices/{inv2['id']}/payments", {"amount": "0.001"}
+        )
+        self.assertEqual(status, 422, body)
+
+    def test_45_huge_invoice_reversal_and_views(self) -> None:
+        # 大额发票的分次冲销、超冲拒绝不留流水，以及逾期/快照/账龄等读路径
+        # 与收款查询口径一致（33 位整数金额、28 位工作线程）。
+        # 注意：测试自身的期望值也要在放大精度下计算，否则 28 位默认上下文会
+        # 在断言前先把分位舍没（与被测缺陷同源）。
+        gross = Decimal("110000000000000000000000000000.00")
+
+        def money(value: Decimal, delta: Decimal = Decimal("0")) -> str:
+            # 减法必须在放大上下文内：作为参数先算好再传入仍会在默认 28 位
+            # 上下文丢分位（与被测缺陷同源）
+            with localcontext() as ctx:
+                ctx.prec = 100
+                return format(value - delta, "f")
+
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "due_date": "2026-09-01",
+                "lines": [
+                    {"net": "100000000000000000000000000000.00", "tax_rate": "0.10"}
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+
+        # 登记 gross - 0.01 的大额收款
+        big_pay = money(gross, Decimal("0.01"))
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": big_pay}
+        )
+        self.assertEqual(status, 201, pay)
+        self.assertEqual(pay["outstanding"], "0.01")
+        payment_id = pay["id"]
+
+        # 分次冲销：先 1.00，再冲剩余净入账（留 1.00 净入账）
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{payment_id}/reversals", {"amount": "1.00"}
+        )
+        self.assertEqual(status, 201, rev)
+        second = money(gross, Decimal("2.01"))
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{payment_id}/reversals", {"amount": second}
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["net_amount"], "1.00")
+
+        # 再冲超过剩余净入账（1.01）-> 422，不留冲销流水
+        status, body = self._request(
+            "POST", f"/api/v1/payments/{payment_id}/reversals", {"amount": "1.01"}
+        )
+        self.assertEqual(status, 422, body)
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(ov["paid_total"], "1.00")
+        self.assertEqual(ov["reversed_total"], money(gross, Decimal("1.01")))
+        self.assertEqual(ov["outstanding"], money(gross, Decimal("1.00")))
+
+        # 逾期查询与收款查询同口径
+        status, overdue = self._request(
+            "GET", "/api/v1/invoices/overdue?page=1&page_size=100&as_of=2030-01-01"
+        )
+        self.assertEqual(status, 200)
+        match = [it for it in overdue["items"] if it["id"] == invoice_id]
+        self.assertEqual(len(match), 1)
+        self.assertEqual(match[0]["outstanding"], money(gross, Decimal("1.00")))
+        self.assertEqual(match[0]["paid_total"], "1.00")
+
+        # 历史快照同口径
+        status, snap = self._request(
+            "GET",
+            f"/api/v1/invoices/{invoice_id}/payment-snapshot"
+            "?at=2031-01-01T00:00:00Z",
+        )
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["received_total"], big_pay)
+        self.assertEqual(snap["reversed_total"], money(gross, Decimal("1.01")))
+        self.assertEqual(snap["net_paid"], "1.00")
+        self.assertEqual(snap["outstanding"], money(gross, Decimal("1.00")))
+
+        # 账龄汇总包含且只包含该未收额
+        status, aging = self._request(
+            "GET", "/api/v1/receivables/aging?as_of=2031-01-01"
+        )
+        self.assertEqual(status, 200)
+        usd = [c for c in aging["currencies"] if c["currency"] == "USD"][0]
+        with localcontext() as ctx:
+            ctx.prec = 100
+            bucket_total = sum(
+                Decimal(b["outstanding"]) for b in usd["buckets"]
+            )
+        self.assertEqual(bucket_total, Decimal(usd["total_outstanding"]))
 
 
 if __name__ == "__main__":

@@ -26,8 +26,10 @@ import json
 import os
 import sqlite3
 from datetime import date, datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP, localcontext
-from typing import Any
+from decimal import Decimal
+from typing import Any, Iterable
+
+from .calc import is_minor_unit_multiple, minor_unit, money_context, quantize_money
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS invoices (
@@ -381,23 +383,31 @@ def list_overdue_invoices(
     paid_map = _paid_totals(conn, [int(r["id"]) for r in rows])
 
     overdue: list[dict[str, Any]] = []
-    for r in rows:
-        unit = _minor_unit(int(r["currency_digits"]))
-        gross = Decimal(r["total_gross"])
-        paid = paid_map.get(int(r["id"]), Decimal("0")).quantize(unit)
-        outstanding = gross - paid
-        if outstanding > 0:
-            overdue.append(
-                {
-                    "id": int(r["id"]),
-                    "currency": r["currency"],
-                    "due_date": r["due_date"],
-                    "total_gross": format(gross, "f"),
-                    "paid_total": format(paid, "f"),
-                    "outstanding": format(outstanding, "f"),
-                    "created_at": r["created_at"],
-                }
+    # 未收余额的 Decimal 运算统一放进度上下文：30 位整数发票的 gross 有 33
+    # 位整数，默认 28 位精度下减去小数收款会丢掉分位，导致已收 0.01 的大额
+    # 发票被错误地继续判为逾期（与收款登记/查询口径不一致）
+    with money_context(
+        *(Decimal(r["total_gross"]) for r in rows), *paid_map.values()
+    ):
+        for r in rows:
+            digits = int(r["currency_digits"])
+            gross = quantize_money(Decimal(r["total_gross"]), digits)
+            paid = quantize_money(
+                paid_map.get(int(r["id"]), Decimal("0")), digits
             )
+            outstanding = gross - paid
+            if outstanding > 0:
+                overdue.append(
+                    {
+                        "id": int(r["id"]),
+                        "currency": r["currency"],
+                        "due_date": r["due_date"],
+                        "total_gross": format(gross, "f"),
+                        "paid_total": format(paid, "f"),
+                        "outstanding": format(outstanding, "f"),
+                        "created_at": r["created_at"],
+                    }
+                )
 
     total = len(overdue)
     offset = (page - 1) * page_size
@@ -408,9 +418,51 @@ def list_overdue_invoices(
 
 
 def _minor_unit(digits: int) -> Decimal:
-    """某币种的 1 个最小单位，例如 digits=2 -> Decimal('0.01')。"""
+    """某币种的 1 个最小单位，例如 digits=2 -> Decimal('0.01')。
 
-    return Decimal(1).scaleb(-digits)
+    统一由 calc 层提供（与开票计算同一套最小单位与精度策略）。
+    """
+
+    return minor_unit(digits)
+
+
+def _signed(value: Decimal) -> tuple[Decimal, int]:
+    """构造一个负号加数（``-value``），供 :func:`_sum_exact` 做上下文内减法。"""
+
+    return (value, -1)
+
+
+def _sum_exact(values: Iterable[Any]) -> Decimal:
+    """在按加数量级放大的局部精度内求**带符号**和。
+
+    收款/冲销/账龄/台账的所有金额累计都走这里：默认 28 位精度下
+    ``0.01 - 1.1E29`` 会把分位舍没——不仅减法如此，连对大额正数取负
+    （``-1.1E29``）本身都会在 28 位上下文被舍成整十数。因此负项以
+    :func:`_signed` 标记，**取负与加减都推迟到放大后的上下文内**完成，
+    保证收款响应、查询、快照与各汇总接口使用完全一致的精确口径。元素
+    可为 ``Decimal``（正项）、:func:`_signed` 产生的负项元组，或上述
+    元素的（嵌套）列表。
+    """
+
+    terms: list[tuple[Decimal, int]] = []
+
+    def _collect(node: Any) -> None:
+        if isinstance(node, Decimal):
+            terms.append((node, 1))
+        elif isinstance(node, tuple) and len(node) == 2 and isinstance(node[0], Decimal):
+            terms.append((node[0], 1 if node[1] >= 0 else -1))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                _collect(child)
+        else:  # pragma: no cover - 内部调用方只传 Decimal/带符号元组/列表
+            raise TypeError(f"_sum_exact 不支持的元素: {node!r}")
+
+    _collect(list(values))
+    with money_context(*(value for value, _sign in terms)):
+        total = Decimal("0")
+        for value, sign in terms:
+            total += value if sign >= 0 else -value
+        return total
 
 
 def _paid_totals_as_of(
@@ -436,8 +488,10 @@ def _paid_totals_as_of(
     paid: dict[int, Decimal] = {}
     for r in rows:
         iid = int(r["invoice_id"])
-        net = Decimal(r["amount"]) - reversed_map.get(int(r["id"]), Decimal("0"))
-        paid[iid] = paid.get(iid, Decimal("0")) + net
+        net = _sum_exact(
+            [Decimal(r["amount"]), _signed(reversed_map.get(int(r["id"]), Decimal("0")))]
+        )
+        paid[iid] = _sum_exact([paid.get(iid, Decimal("0")), net])
     return paid
 
 
@@ -471,7 +525,7 @@ def _reversed_totals(
     totals: dict[int, Decimal] = {}
     for r in rows:
         pid = int(r["payment_id"])
-        totals[pid] = totals.get(pid, Decimal("0")) + Decimal(r["amount"])
+        totals[pid] = _sum_exact([totals.get(pid, Decimal("0")), Decimal(r["amount"])])
     return totals
 
 
@@ -482,12 +536,12 @@ def _paid_total(conn: sqlite3.Connection, invoice_id: int) -> Decimal:
         "SELECT id, amount FROM payments WHERE invoice_id = ?", (invoice_id,)
     ).fetchall()
     reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows])
-    return sum(
-        (
-            Decimal(r["amount"]) - reversed_map.get(int(r["id"]), Decimal("0"))
-            for r in rows
-        ),
-        Decimal("0"),
+    return _sum_exact(
+        [
+            Decimal(r["amount"]),
+            _signed(reversed_map.get(int(r["id"]), Decimal("0"))),
+        ]
+        for r in rows
     )
 
 
@@ -503,9 +557,15 @@ def register_payment(
     * 发票不存在 -> :class:`InvoiceNotFoundError`
     * 金额不是币种最小单位整数倍、或累计净入账将超过含税总额 -> ``ValueError``
       （事务回滚，不留下任何记录；由 API 层映射为 422）
+
+    金额解析、整除校验、``quantize``、未收余额减法与响应组装全部在按本次
+    金额量级放大的局部精度（:func:`calc.money_context`）内进行，默认 28 位
+    精度不会丢掉大额发票的分位、也不会对大额收款抛 ``InvalidOperation``。
     """
 
     conn.execute("BEGIN IMMEDIATE")
+    created_at: str | None = None
+    cur = None
     try:
         inv = conn.execute(
             "SELECT currency, currency_digits, total_gross FROM invoices WHERE id = ?",
@@ -516,45 +576,56 @@ def register_payment(
 
         digits = int(inv["currency_digits"])
         unit = _minor_unit(digits)
-        if (amount / unit) != (amount / unit).to_integral_value():
-            raise ValueError(
-                f"收款金额 {amount} 不是 {inv['currency']} 最小单位 {unit} 的整数倍"
-            )
-        amount = amount.quantize(unit)
-
         gross = Decimal(inv["total_gross"])
-        paid = _paid_total(conn, invoice_id)
-        outstanding = gross - paid
-        if amount > outstanding:
-            raise ValueError(
-                f"收款 {amount} 超出未收余额 {outstanding}"
-                f"（含税总额 {gross}，已收 {paid}），未登记任何记录"
-            )
+        paid_before = _paid_total(conn, invoice_id)
 
-        created_at = utc_now_iso()
-        cur = conn.execute(
-            """
-            INSERT INTO payments (invoice_id, amount, currency, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (invoice_id, format(amount, "f"), inv["currency"], created_at),
-        )
+        with money_context(amount, gross, paid_before, extra_digits=digits):
+            if amount <= 0:
+                raise ValueError(f"收款金额必须大于 0，收到 {amount}")
+            if not is_minor_unit_multiple(amount, unit):
+                raise ValueError(
+                    f"收款金额 {amount} 不是 {inv['currency']} 最小单位 "
+                    f"{format(unit, 'f')} 的整数倍"
+                )
+            amount = quantize_money(amount, digits)
+
+            outstanding_before = gross - quantize_money(paid_before, digits)
+            if amount > outstanding_before:
+                raise ValueError(
+                    f"收款 {format(amount, 'f')} 超出未收余额 "
+                    f"{format(outstanding_before, 'f')}"
+                    f"（含税总额 {format(gross, 'f')}，已收 "
+                    f"{format(paid_before, 'f')}），未登记任何记录"
+                )
+
+            new_paid = quantize_money(paid_before + amount, digits)
+            new_outstanding = gross - new_paid
+
+            created_at = utc_now_iso()
+            cur = conn.execute(
+                """
+                INSERT INTO payments (invoice_id, amount, currency, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (invoice_id, format(amount, "f"), inv["currency"], created_at),
+            )
+            payment_id = int(cur.lastrowid)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
-    new_paid = paid + amount
+    zero = quantize_money(Decimal("0"), digits)
     return {
-        "id": int(cur.lastrowid),
+        "id": payment_id,
         "invoice_id": invoice_id,
         "amount": format(amount, "f"),
         "currency": inv["currency"],
         "created_at": created_at,
-        "reversed_total": format(Decimal("0").quantize(unit), "f"),
+        "reversed_total": format(zero, "f"),
         "net_amount": format(amount, "f"),
         "paid_total": format(new_paid, "f"),
-        "outstanding": format(gross - new_paid, "f"),
+        "outstanding": format(new_outstanding, "f"),
     }
 
 
@@ -580,6 +651,8 @@ def reverse_payment(
     """
 
     conn.execute("BEGIN IMMEDIATE")
+    created_at: str | None = None
+    cur = None
     try:
         pay = conn.execute(
             """
@@ -592,48 +665,60 @@ def reverse_payment(
         if pay is None:
             raise PaymentNotFoundError(payment_id)
 
-        unit = _minor_unit(int(pay["currency_digits"]))
-        if amount <= 0:
-            raise ValueError(f"冲销金额必须大于 0，收到 {amount}")
-        if (amount / unit) != (amount / unit).to_integral_value():
-            raise ValueError(
-                f"冲销金额 {amount} 不是 {pay['currency']} 最小单位 {unit} 的整数倍"
-            )
-        amount = amount.quantize(unit)
-
+        digits = int(pay["currency_digits"])
+        unit = _minor_unit(digits)
         original = Decimal(pay["amount"])
         reversed_so_far = _reversed_totals(conn, [payment_id]).get(
             payment_id, Decimal("0")
         )
-        if reversed_so_far + amount > original:
-            raise ValueError(
-                f"冲销 {amount} 后累计冲销将达 {reversed_so_far + amount}，"
-                f"超过原收款 {original}（已冲销 {reversed_so_far}），未写入任何记录"
-            )
 
-        created_at = utc_now_iso()
-        cur = conn.execute(
-            """
-            INSERT INTO payment_reversals (payment_id, amount, currency, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (payment_id, format(amount, "f"), pay["currency"], created_at),
-        )
+        # 大额原收款（如 30 位整数发票产生的分配流水）的整除校验与 quantize
+        # 同样在按量级放大的局部精度内进行，避免 28 位默认精度误判/抛异常
+        with money_context(
+            amount, original, reversed_so_far, extra_digits=digits
+        ):
+            if amount <= 0:
+                raise ValueError(f"冲销金额必须大于 0，收到 {amount}")
+            if not is_minor_unit_multiple(amount, unit):
+                raise ValueError(
+                    f"冲销金额 {amount} 不是 {pay['currency']} 最小单位 "
+                    f"{format(unit, 'f')} 的整数倍"
+                )
+            amount = quantize_money(amount, digits)
+
+            new_reversed = quantize_money(reversed_so_far + amount, digits)
+            if new_reversed > original:
+                raise ValueError(
+                    f"冲销 {format(amount, 'f')} 后累计冲销将达 "
+                    f"{format(new_reversed, 'f')}，超过原收款 "
+                    f"{format(original, 'f')}（已冲销 {format(reversed_so_far, 'f')}），"
+                    f"未写入任何记录"
+                )
+            net_after = original - new_reversed
+
+            created_at = utc_now_iso()
+            cur = conn.execute(
+                """
+                INSERT INTO payment_reversals (payment_id, amount, currency, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (payment_id, format(amount, "f"), pay["currency"], created_at),
+            )
+            reversal_id = int(cur.lastrowid)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
-    new_reversed = reversed_so_far + amount
     return {
-        "id": int(cur.lastrowid),
+        "id": reversal_id,
         "payment_id": payment_id,
         "invoice_id": int(pay["invoice_id"]),
         "amount": format(amount, "f"),
         "currency": pay["currency"],
         "created_at": created_at,
         "reversed_total": format(new_reversed, "f"),
-        "net_amount": format(original - new_reversed, "f"),
+        "net_amount": format(net_after, "f"),
     }
 
 
@@ -651,8 +736,10 @@ def _paid_totals(conn: sqlite3.Connection, invoice_ids: list[int]) -> dict[int, 
     paid: dict[int, Decimal] = {}
     for r in rows:
         iid = int(r["invoice_id"])
-        net = Decimal(r["amount"]) - reversed_map.get(int(r["id"]), Decimal("0"))
-        paid[iid] = paid.get(iid, Decimal("0")) + net
+        net = _sum_exact(
+            [Decimal(r["amount"]), _signed(reversed_map.get(int(r["id"]), Decimal("0")))]
+        )
+        paid[iid] = _sum_exact([paid.get(iid, Decimal("0")), net])
     return paid
 
 
@@ -722,84 +809,98 @@ def allocate_payment(
         digits = digits_by_id[invoice_ids[0]]
         unit = _minor_unit(digits)
 
-        if amount <= 0:
-            raise ValueError(f"来款金额必须大于 0，收到 {amount}")
-        if (amount / unit) != (amount / unit).to_integral_value():
-            raise ValueError(
-                f"来款金额 {amount} 不是 {currency} 最小单位 {unit} 的整数倍"
-            )
-        amount = amount.quantize(unit)
-
         paid_map = _paid_totals(conn, invoice_ids)
-        outstanding: dict[int, Decimal] = {}
-        for invoice_id in invoice_ids:
-            r = found[invoice_id]
-            outstanding[invoice_id] = Decimal(r["total_gross"]) - paid_map.get(
-                invoice_id, Decimal("0")
-            )
+        gross_map = {iid: Decimal(found[iid]["total_gross"]) for iid in invoice_ids}
 
-        total_outstanding = sum(outstanding.values(), Decimal("0"))
-        if amount > total_outstanding:
-            raise ValueError(
-                f"来款 {amount} {currency} 超出列表内发票未收余额合计 "
-                f"{format(total_outstanding, 'f')}，整笔拒绝，未登记任何记录"
-            )
-
-        # 到期日升序、NULL 排最后（is None -> True=1）；同日（含都为空）按 ID 升序
-        ordered_ids = sorted(
-            invoice_ids,
-            key=lambda i: (found[i]["due_date"] is None, found[i]["due_date"], i),
-        )
-
-        remaining = amount
-        created_at = utc_now_iso()
-        # 批次头与收款流水、批次明细在同一事务内写入；批次 id 用于整批撤销
-        batch_cur = conn.execute(
-            """
-            INSERT INTO payment_allocation_batches (amount, currency, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (format(amount, "f"), currency, created_at),
-        )
-        batch_id = int(batch_cur.lastrowid)
-        items: list[dict[str, Any]] = []
-        seq = 0
-        for invoice_id in ordered_ids:
-            due = outstanding[invoice_id]
-            allocated = remaining if remaining < due else due
-            payment_id: int | None = None
-            if allocated > 0:
-                seq += 1
-                cur = conn.execute(
-                    """
-                    INSERT INTO payments (invoice_id, amount, currency, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (invoice_id, format(allocated, "f"), currency, created_at),
+        # 整除校验、quantize、各发票未收余额与逐张抵扣全部统一在按量级放大的
+        # 局部精度内计算：大额发票（如 30 位整数）下默认 28 位精度会丢掉分位
+        # 或对大额金额抛 InvalidOperation，导致分配金额/剩余余额错误
+        with money_context(
+            amount, *gross_map.values(), *paid_map.values(), extra_digits=digits
+        ):
+            if amount <= 0:
+                raise ValueError(f"来款金额必须大于 0，收到 {amount}")
+            if not is_minor_unit_multiple(amount, unit):
+                raise ValueError(
+                    f"来款金额 {amount} 不是 {currency} 最小单位 "
+                    f"{format(unit, 'f')} 的整数倍"
                 )
-                payment_id = int(cur.lastrowid)
-                # 记录本次生成的收款关联（批次撤销据此逐笔冲销）
-                conn.execute(
-                    """
-                    INSERT INTO payment_allocation_batch_items (
-                        batch_id, payment_id, invoice_id, allocated, seq, reversal_id
-                    ) VALUES (?, ?, ?, ?, ?, NULL)
-                    """,
-                    (batch_id, payment_id, invoice_id, format(allocated, "f"), seq),
+            amount = quantize_money(amount, digits)
+
+            outstanding: dict[int, Decimal] = {}
+            for invoice_id in invoice_ids:
+                outstanding[invoice_id] = quantize_money(
+                    gross_map[invoice_id]
+                    - quantize_money(
+                        paid_map.get(invoice_id, Decimal("0")), digits
+                    ),
+                    digits,
                 )
-                remaining -= allocated
-            items.append(
-                {
-                    "invoice_id": invoice_id,
-                    "due_date": found[invoice_id]["due_date"],
-                    "allocated": format(allocated, "f"),
-                    "outstanding": format(due - allocated, "f"),
-                    "payment_id": payment_id,
-                }
+
+            total_outstanding = sum(outstanding.values(), Decimal("0"))
+            if amount > total_outstanding:
+                raise ValueError(
+                    f"来款 {format(amount, 'f')} {currency} 超出列表内发票未收余额合计 "
+                    f"{format(total_outstanding, 'f')}，整笔拒绝，未登记任何记录"
+                )
+
+            # 到期日升序、NULL 排最后（is None -> True=1）；同日（含都为空）按 ID 升序
+            ordered_ids = sorted(
+                invoice_ids,
+                key=lambda i: (found[i]["due_date"] is None, found[i]["due_date"], i),
             )
-        if remaining != 0:
-            # 不变量防御：上面已校验总未收充足，理论上不可能剩余
-            raise AssertionError(f"来款分配后仍有余额 {format(remaining, 'f')} 未抵扣")
+
+            remaining = amount
+            created_at = utc_now_iso()
+            # 批次头与收款流水、批次明细在同一事务内写入；批次 id 用于整批撤销
+            batch_cur = conn.execute(
+                """
+                INSERT INTO payment_allocation_batches (amount, currency, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (format(amount, "f"), currency, created_at),
+            )
+            batch_id = int(batch_cur.lastrowid)
+            items: list[dict[str, Any]] = []
+            seq = 0
+            for invoice_id in ordered_ids:
+                due = outstanding[invoice_id]
+                allocated = remaining if remaining < due else due
+                payment_id: int | None = None
+                if allocated > 0:
+                    seq += 1
+                    cur = conn.execute(
+                        """
+                        INSERT INTO payments (invoice_id, amount, currency, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (invoice_id, format(allocated, "f"), currency, created_at),
+                    )
+                    payment_id = int(cur.lastrowid)
+                    # 记录本次生成的收款关联（批次撤销据此逐笔冲销）
+                    conn.execute(
+                        """
+                        INSERT INTO payment_allocation_batch_items (
+                            batch_id, payment_id, invoice_id, allocated, seq, reversal_id
+                        ) VALUES (?, ?, ?, ?, ?, NULL)
+                        """,
+                        (batch_id, payment_id, invoice_id, format(allocated, "f"), seq),
+                    )
+                    remaining -= allocated
+                items.append(
+                    {
+                        "invoice_id": invoice_id,
+                        "due_date": found[invoice_id]["due_date"],
+                        "allocated": format(allocated, "f"),
+                        "outstanding": format(due - allocated, "f"),
+                        "payment_id": payment_id,
+                    }
+                )
+            if remaining != 0:
+                # 不变量防御：上面已校验总未收充足，理论上不可能剩余
+                raise AssertionError(
+                    f"来款分配后仍有余额 {format(remaining, 'f')} 未抵扣"
+                )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -894,65 +995,74 @@ def reverse_allocation_batch(
         created_at = utc_now_iso()
         result_items: list[dict[str, Any]] = []
         batch_reversed_total = Decimal("0")
-        for r in item_rows:
-            payment_id = int(r["payment_id"])
-            item_unit = _minor_unit(int(r["currency_digits"]))
-            original = Decimal(r["payment_amount"])
-            net_before = (
-                original - reversed_map.get(payment_id, Decimal("0"))
-            ).quantize(item_unit)
-
-            reversal_id = r["reversal_id"]
-            if net_before > 0:
-                # 正余额：追加一条等额冲销（净余额为最小单位整数倍，天然不超额）
-                cur = conn.execute(
-                    """
-                    INSERT INTO payment_reversals (payment_id, amount, currency, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (payment_id, format(net_before, "f"), batch["currency"], created_at),
-                )
-                reversal_id = int(cur.lastrowid)
-                conn.execute(
-                    "UPDATE payment_allocation_batch_items SET reversal_id = ?"
-                    " WHERE batch_id = ? AND payment_id = ?",
-                    (reversal_id, batch_id, payment_id),
-                )
-                reversed_map[payment_id] = (
-                    reversed_map.get(payment_id, Decimal("0")) + net_before
-                )
-                this_amount = net_before
-                this_created_at: str | None = created_at
-                created = True
-                net_after = Decimal("0").quantize(item_unit)
-            elif reversal_id is not None:
-                # 重复请求：沿用本批次此前已生成的冲销，不新增
-                prior = prior_rows[int(reversal_id)]
-                this_amount = Decimal(prior["amount"]).quantize(item_unit)
-                this_created_at = prior["created_at"]
-                net_after = net_before  # 已为 0
-            else:
-                # 批次撤销前该收款已被手工冲销完：本批次不产生冲销
-                this_amount = Decimal("0").quantize(item_unit)
-                this_created_at = None
-                net_after = net_before  # 已为 0
-
-            batch_reversed_total += this_amount
-            result_items.append(
-                {
-                    "seq": int(r["seq"]),
-                    "payment_id": payment_id,
-                    "invoice_id": int(r["invoice_id"]),
-                    "allocated": Decimal(r["allocated"]).quantize(item_unit),
-                    "reversal_id": reversal_id,
-                    "reversed_amount": this_amount,
-                    "reversal_created_at": this_created_at,
-                    "net_amount": net_after,
-                }
-            )
-
         digits = int(item_rows[0]["currency_digits"]) if item_rows else 2
-        unit = _minor_unit(digits)
+        money_inputs = [Decimal(batch["amount"])]
+        money_inputs.extend(Decimal(r["payment_amount"]) for r in item_rows)
+        money_inputs.extend(Decimal(r["allocated"]) for r in item_rows)
+        money_inputs.extend(reversed_map.values())
+        money_inputs.extend(Decimal(r["amount"]) for r in prior_rows.values())
+        # 净入账额/等额冲销的减法与 quantize 统一在按量级放大的局部精度内，
+        # 大额（30 位整数）批次不会因默认 28 位精度抛 InvalidOperation
+        with money_context(*money_inputs, extra_digits=digits):
+            for r in item_rows:
+                payment_id = int(r["payment_id"])
+                item_digits = int(r["currency_digits"])
+                original = Decimal(r["payment_amount"])
+                net_before = quantize_money(
+                    original - reversed_map.get(payment_id, Decimal("0")), item_digits
+                )
+
+                reversal_id = r["reversal_id"]
+                if net_before > 0:
+                    # 正余额：追加一条等额冲销（净余额为最小单位整数倍，天然不超额）
+                    cur = conn.execute(
+                        """
+                        INSERT INTO payment_reversals (payment_id, amount, currency, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (payment_id, format(net_before, "f"), batch["currency"], created_at),
+                    )
+                    reversal_id = int(cur.lastrowid)
+                    conn.execute(
+                        "UPDATE payment_allocation_batch_items SET reversal_id = ?"
+                        " WHERE batch_id = ? AND payment_id = ?",
+                        (reversal_id, batch_id, payment_id),
+                    )
+                    reversed_map[payment_id] = (
+                        reversed_map.get(payment_id, Decimal("0")) + net_before
+                    )
+                    this_amount = net_before
+                    this_created_at: str | None = created_at
+                    created = True
+                    net_after = quantize_money(Decimal("0"), item_digits)
+                elif reversal_id is not None:
+                    # 重复请求：沿用本批次此前已生成的冲销，不新增
+                    prior = prior_rows[int(reversal_id)]
+                    this_amount = quantize_money(Decimal(prior["amount"]), item_digits)
+                    this_created_at = prior["created_at"]
+                    net_after = net_before  # 已为 0
+                else:
+                    # 批次撤销前该收款已被手工冲销完：本批次不产生冲销
+                    this_amount = quantize_money(Decimal("0"), item_digits)
+                    this_created_at = None
+                    net_after = net_before  # 已为 0
+
+                batch_reversed_total += this_amount
+                result_items.append(
+                    {
+                        "seq": int(r["seq"]),
+                        "payment_id": payment_id,
+                        "invoice_id": int(r["invoice_id"]),
+                        "allocated": quantize_money(
+                            Decimal(r["allocated"]), item_digits
+                        ),
+                        "reversal_id": reversal_id,
+                        "reversed_amount": this_amount,
+                        "reversal_created_at": this_created_at,
+                        "net_amount": net_after,
+                    }
+                )
+            batch_reversed_total = quantize_money(batch_reversed_total, digits)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -977,7 +1087,7 @@ def reverse_allocation_batch(
         "currency": batch["currency"],
         "created_at": batch["created_at"],
         "allocated_total": batch["amount"],
-        "reversed_total": format(batch_reversed_total.quantize(unit), "f"),
+        "reversed_total": format(batch_reversed_total, "f"),
         "reversal_count": sum(1 for it in items_out if it["reversal_id"] is not None),
         "items": items_out,
     }
@@ -997,39 +1107,44 @@ def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str
             (invoice["id"],),
         ).fetchall()
     )
-    unit = _minor_unit(int(invoice["currency_digits"]))
+    digits = int(invoice["currency_digits"])
     reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows])
     gross = Decimal(invoice["total_gross"])
-    paid = Decimal("0")
-    reversed_total = Decimal("0")
-    payments: list[dict[str, Any]] = []
-    for r in rows:
-        rev = reversed_map.get(int(r["id"]), Decimal("0")).quantize(unit)
-        net = Decimal(r["amount"]) - rev
-        paid += net
-        reversed_total += rev
-        payments.append(
-            {
-                "id": r["id"],
-                "invoice_id": r["invoice_id"],
-                "amount": r["amount"],
-                "currency": r["currency"],
-                "created_at": r["created_at"],
-                "reversed_total": format(rev, "f"),
-                "net_amount": format(net, "f"),
-            }
-        )
-    paid = paid.quantize(unit)
-    return {
-        "invoice_id": invoice["id"],
-        "currency": invoice["currency"],
-        "total_gross": invoice["total_gross"],
-        "paid_total": format(paid, "f"),
-        "reversed_total": format(reversed_total.quantize(unit), "f"),
-        "outstanding": format(gross - paid, "f"),
-        "payment_count": len(rows),
-        "payments": payments,
-    }
+    amount_inputs = [Decimal(r["amount"]) for r in rows]
+    # 与登记/冲销/快照同一精度策略：大额发票下默认 28 位精度会丢分位或抛异常
+    with money_context(gross, *amount_inputs, *reversed_map.values(), extra_digits=digits):
+        paid = Decimal("0")
+        reversed_total = Decimal("0")
+        payments: list[dict[str, Any]] = []
+        for r in rows:
+            rev = quantize_money(reversed_map.get(int(r["id"]), Decimal("0")), digits)
+            net = quantize_money(Decimal(r["amount"]) - rev, digits)
+            paid += net
+            reversed_total += rev
+            payments.append(
+                {
+                    "id": r["id"],
+                    "invoice_id": r["invoice_id"],
+                    "amount": r["amount"],
+                    "currency": r["currency"],
+                    "created_at": r["created_at"],
+                    "reversed_total": format(rev, "f"),
+                    "net_amount": format(net, "f"),
+                }
+            )
+        paid = quantize_money(paid, digits)
+        reversed_total = quantize_money(reversed_total, digits)
+        outstanding = gross - paid
+        return {
+            "invoice_id": invoice["id"],
+            "currency": invoice["currency"],
+            "total_gross": format(gross, "f"),
+            "paid_total": format(paid, "f"),
+            "reversed_total": format(reversed_total, "f"),
+            "outstanding": format(outstanding, "f"),
+            "payment_count": len(rows),
+            "payments": payments,
+        }
 
 
 # ---- 历史收款快照 ----
@@ -1093,61 +1208,68 @@ def payment_snapshot(
             ).fetchall()
         )
 
-    unit = _minor_unit(int(invoice["currency_digits"]))
+    digits = int(invoice["currency_digits"])
     gross = Decimal(invoice["total_gross"])
-    received_total = Decimal("0")
-    reversed_total = Decimal("0")
-    payments: list[dict[str, Any]] = []
-    for r in payment_rows:
-        amount = Decimal(r["amount"])
-        rev = reversed_map.get(int(r["id"]), Decimal("0")).quantize(unit)
-        net = amount - rev
-        received_total += amount
-        reversed_total += rev
-        payments.append(
-            {
-                "id": r["id"],
-                "invoice_id": r["invoice_id"],
-                "amount": format(amount.quantize(unit), "f"),
-                "currency": r["currency"],
-                "created_at": r["created_at"],
-                "reversed_total": format(rev, "f"),
-                "net_amount": format(net, "f"),
-            }
-        )
+    money_inputs = [gross]
+    money_inputs.extend(Decimal(r["amount"]) for r in payment_rows)
+    money_inputs.extend(Decimal(r["amount"]) for r in reversal_rows)
+    money_inputs.extend(reversed_map.values())
+    # 与当前收款查询同一精度策略：大额发票（30 位整数）的历史快照也必须
+    # 精确保留分位，默认 28 位上下文不得截断或抛 InvalidOperation
+    with money_context(*money_inputs, extra_digits=digits):
+        received_total = Decimal("0")
+        reversed_total = Decimal("0")
+        payments: list[dict[str, Any]] = []
+        for r in payment_rows:
+            amount = quantize_money(Decimal(r["amount"]), digits)
+            rev = quantize_money(reversed_map.get(int(r["id"]), Decimal("0")), digits)
+            net = quantize_money(amount - rev, digits)
+            received_total += amount
+            reversed_total += rev
+            payments.append(
+                {
+                    "id": r["id"],
+                    "invoice_id": r["invoice_id"],
+                    "amount": format(amount, "f"),
+                    "currency": r["currency"],
+                    "created_at": r["created_at"],
+                    "reversed_total": format(rev, "f"),
+                    "net_amount": format(net, "f"),
+                }
+            )
 
-    reversals: list[dict[str, Any]] = []
-    for r in reversal_rows:
-        amount = Decimal(r["amount"]).quantize(unit)
-        reversals.append(
-            {
-                "id": r["id"],
-                "payment_id": r["payment_id"],
-                "invoice_id": invoice["id"],
-                "amount": format(amount, "f"),
-                "currency": r["currency"],
-                "created_at": r["created_at"],
-            }
-        )
+        reversals: list[dict[str, Any]] = []
+        for r in reversal_rows:
+            amount = quantize_money(Decimal(r["amount"]), digits)
+            reversals.append(
+                {
+                    "id": r["id"],
+                    "payment_id": r["payment_id"],
+                    "invoice_id": invoice["id"],
+                    "amount": format(amount, "f"),
+                    "currency": r["currency"],
+                    "created_at": r["created_at"],
+                }
+            )
 
-    received_total = received_total.quantize(unit)
-    reversed_total = reversed_total.quantize(unit)
-    net_paid = (received_total - reversed_total).quantize(unit)
-    return {
-        "invoice_id": invoice["id"],
-        "currency": invoice["currency"],
-        "at": at_text,
-        "invoice_created_at": created_text,
-        "total_gross": format(gross.quantize(unit), "f"),
-        "received_total": format(received_total, "f"),
-        "reversed_total": format(reversed_total, "f"),
-        "net_paid": format(net_paid, "f"),
-        "outstanding": format((gross - net_paid).quantize(unit), "f"),
-        "payment_count": len(payment_rows),
-        "reversal_count": len(reversal_rows),
-        "payments": payments,
-        "reversals": reversals,
-    }
+        received_total = quantize_money(received_total, digits)
+        reversed_total = quantize_money(reversed_total, digits)
+        net_paid = quantize_money(received_total - reversed_total, digits)
+        return {
+            "invoice_id": invoice["id"],
+            "currency": invoice["currency"],
+            "at": at_text,
+            "invoice_created_at": created_text,
+            "total_gross": format(gross, "f"),
+            "received_total": format(received_total, "f"),
+            "reversed_total": format(reversed_total, "f"),
+            "net_paid": format(net_paid, "f"),
+            "outstanding": format(gross - net_paid, "f"),
+            "payment_count": len(payment_rows),
+            "reversal_count": len(reversal_rows),
+            "payments": payments,
+            "reversals": reversals,
+        }
 
 
 # ---- 分期回款计划 ----
@@ -1206,45 +1328,51 @@ def create_installment_plan(
         if existing is not None:
             raise PlanAlreadyExistsError(invoice_id, int(existing["id"]))
 
-        unit = _minor_unit(int(inv["currency_digits"]))
+        digits = int(inv["currency_digits"])
+        unit = _minor_unit(digits)
         gross = Decimal(inv["total_gross"])
 
-        amounts: list[Decimal] = []
-        for idx, (_due, raw_amount) in enumerate(installments, start=1):
-            if raw_amount <= 0:
-                raise ValueError(f"第 {idx} 期金额必须大于 0，收到 {raw_amount}")
-            if (raw_amount / unit) != (raw_amount / unit).to_integral_value():
+        # 大额发票（30 位整数）下期次整除校验/quantize/合计比较同样统一在按
+        # 量级放大的局部精度内，避免默认 28 位精度误判或抛 InvalidOperation
+        with money_context(
+            gross, *(a for _d, a in installments), extra_digits=digits
+        ):
+            amounts: list[Decimal] = []
+            for idx, (_due, raw_amount) in enumerate(installments, start=1):
+                if raw_amount <= 0:
+                    raise ValueError(f"第 {idx} 期金额必须大于 0，收到 {raw_amount}")
+                if not is_minor_unit_multiple(raw_amount, unit):
+                    raise ValueError(
+                        f"第 {idx} 期金额 {raw_amount} 不是 {inv['currency']} 最小单位 "
+                        f"{format(unit, 'f')} 的整数倍"
+                    )
+                amounts.append(quantize_money(raw_amount, digits))
+
+            total = sum(amounts, Decimal("0"))
+            if total != gross:
                 raise ValueError(
-                    f"第 {idx} 期金额 {raw_amount} 不是 {inv['currency']} 最小单位 "
-                    f"{unit} 的整数倍"
+                    f"期次合计 {format(total, 'f')} 与发票含税总额 "
+                    f"{format(gross, 'f')} 不一致，未创建任何计划"
                 )
-            amounts.append(raw_amount.quantize(unit))
 
-        total = sum(amounts, Decimal("0"))
-        if total != gross:
-            raise ValueError(
-                f"期次合计 {format(total, 'f')} 与发票含税总额 "
-                f"{format(gross, 'f')} 不一致，未创建任何计划"
+            created_at = utc_now_iso()
+            cur = conn.execute(
+                "INSERT INTO installment_plans (invoice_id, created_at) VALUES (?, ?)",
+                (invoice_id, created_at),
             )
-
-        created_at = utc_now_iso()
-        cur = conn.execute(
-            "INSERT INTO installment_plans (invoice_id, created_at) VALUES (?, ?)",
-            (invoice_id, created_at),
-        )
-        plan_id = int(cur.lastrowid)
-        conn.executemany(
-            """
-            INSERT INTO installment_plan_items (plan_id, installment, due_date, amount)
-            VALUES (?, ?, ?, ?)
-            """,
-            [
-                (plan_id, idx, due, format(amount, "f"))
-                for idx, ((due, _raw), amount) in enumerate(
-                    zip(installments, amounts), start=1
-                )
-            ],
-        )
+            plan_id = int(cur.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO installment_plan_items (plan_id, installment, due_date, amount)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (plan_id, idx, due, format(amount, "f"))
+                    for idx, ((due, _raw), amount) in enumerate(
+                        zip(installments, amounts), start=1
+                    )
+                ],
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1279,50 +1407,61 @@ def installment_plan_status(
 
     invoice_id = int(invoice["id"])
     currency = invoice["currency"]
-    unit = _minor_unit(int(invoice["currency_digits"]))
-    gross = Decimal(invoice["total_gross"]).quantize(unit)
-    net_paid = _paid_total(conn, invoice_id).quantize(unit)
+    digits = int(invoice["currency_digits"])
+    gross_raw = Decimal(invoice["total_gross"])
+    paid_raw = _paid_total(conn, invoice_id)
+    amount_inputs = [Decimal(r["amount"]) for r in item_rows]
+    # 与收款查询同一精度策略：大额发票的分期 FIFO 抵扣同样不能丢分位
+    with money_context(
+        gross_raw, paid_raw, *amount_inputs, extra_digits=digits
+    ):
+        gross = quantize_money(gross_raw, digits)
+        net_paid = quantize_money(paid_raw, digits)
 
-    as_of_text = as_of.isoformat()
-    remaining_credit = net_paid
-    items: list[dict[str, Any]] = []
-    covered_total = Decimal("0")
-    uncovered_total = Decimal("0")
-    overdue_total = Decimal("0")
-    for r in item_rows:
-        amount = Decimal(r["amount"]).quantize(unit)
-        covered = remaining_credit if remaining_credit < amount else amount
-        if covered > 0:
-            remaining_credit -= covered
-        uncovered = amount - covered
-        overdue = uncovered if r["due_date"] < as_of_text else Decimal("0").quantize(unit)
-        covered_total += covered
-        uncovered_total += uncovered
-        overdue_total += overdue
-        items.append(
-            {
-                "installment": int(r["installment"]),
-                "due_date": r["due_date"],
-                "amount": format(amount, "f"),
-                "covered": format(covered, "f"),
-                "uncovered": format(uncovered, "f"),
-                "overdue": format(overdue, "f"),
-            }
-        )
+        as_of_text = as_of.isoformat()
+        remaining_credit = net_paid
+        items: list[dict[str, Any]] = []
+        covered_total = Decimal("0")
+        uncovered_total = Decimal("0")
+        overdue_total = Decimal("0")
+        for r in item_rows:
+            amount = quantize_money(Decimal(r["amount"]), digits)
+            covered = remaining_credit if remaining_credit < amount else amount
+            if covered > 0:
+                remaining_credit -= covered
+            uncovered = amount - covered
+            overdue = (
+                uncovered
+                if r["due_date"] < as_of_text
+                else quantize_money(Decimal("0"), digits)
+            )
+            covered_total += covered
+            uncovered_total += uncovered
+            overdue_total += overdue
+            items.append(
+                {
+                    "installment": int(r["installment"]),
+                    "due_date": r["due_date"],
+                    "amount": format(amount, "f"),
+                    "covered": format(covered, "f"),
+                    "uncovered": format(uncovered, "f"),
+                    "overdue": format(overdue, "f"),
+                }
+            )
 
-    return {
-        "plan_id": plan_id,
-        "invoice_id": invoice_id,
-        "currency": currency,
-        "created_at": created_at,
-        "as_of": as_of_text,
-        "total_gross": format(gross, "f"),
-        "net_paid": format(net_paid, "f"),
-        "covered_total": format(covered_total.quantize(unit), "f"),
-        "uncovered_total": format(uncovered_total.quantize(unit), "f"),
-        "overdue_total": format(overdue_total.quantize(unit), "f"),
-        "installments": items,
-    }
+        return {
+            "plan_id": plan_id,
+            "invoice_id": invoice_id,
+            "currency": currency,
+            "created_at": created_at,
+            "as_of": as_of_text,
+            "total_gross": format(gross, "f"),
+            "net_paid": format(net_paid, "f"),
+            "covered_total": format(covered_total, "f"),
+            "uncovered_total": format(uncovered_total, "f"),
+            "overdue_total": format(overdue_total, "f"),
+            "installments": items,
+        }
 
 
 # ---- 原发票贷项凭证 ----
@@ -1350,7 +1489,10 @@ def _credited_totals(
     for r in rows:
         line_no = int(r["line_no"])
         prev_net, prev_tax = totals.get(line_no, (Decimal("0"), Decimal("0")))
-        totals[line_no] = (prev_net + Decimal(r["net"]), prev_tax + Decimal(r["tax"]))
+        totals[line_no] = (
+            _sum_exact([prev_net, Decimal(r["net"])]),
+            _sum_exact([prev_tax, Decimal(r["tax"])]),
+        )
     return totals
 
 
@@ -1402,7 +1544,8 @@ def create_credit_memo(
             )
             raise ValueError(f"贷项凭证明细包含重复行号：{dupes}")
 
-        unit = _minor_unit(int(inv["currency_digits"]))
+        digits = int(inv["currency_digits"])
+        unit = _minor_unit(digits)
         original_rows = {
             int(r["line_no"]): r
             for r in conn.execute(
@@ -1412,13 +1555,20 @@ def create_credit_memo(
         }
         prev_totals = _credited_totals(conn, invoice_id)
 
+        # 统一精度策略：大额发票（30 位整数净额/税额）下，固定 50 位仍可能不足，
+        # 这里按本次输入量级放大；products=1 覆盖「税额 × 累计净额 ÷ 原净额」连乘
+        money_inputs: list[Decimal] = [a for _ln, a in items]
+        money_inputs.extend(Decimal(r["net"]) for r in original_rows.values())
+        money_inputs.extend(Decimal(r["tax"]) for r in original_rows.values())
+        for prev_net, prev_tax in prev_totals.values():
+            money_inputs.extend((prev_net, prev_tax))
+
         # 保持请求顺序（而非按行号排序）：逐行展示的行序与提交一致
         result_lines: list[dict[str, Any]] = []
         memo_net = Decimal("0")
         memo_tax = Decimal("0")
         memo_gross = Decimal("0")
-        with localcontext() as ctx:
-            ctx.prec = 50
+        with money_context(*money_inputs, extra_digits=digits, products=1):
             for line_no, raw_net in items:
                 original = original_rows.get(line_no)
                 if original is None:
@@ -1436,12 +1586,12 @@ def create_credit_memo(
                     raise ValueError(
                         f"行 {line_no} 的本次抵扣净额必须大于 0，收到 {raw_net}"
                     )
-                if (raw_net / unit) != (raw_net / unit).to_integral_value():
+                if not is_minor_unit_multiple(raw_net, unit):
                     raise ValueError(
                         f"行 {line_no} 的本次抵扣净额 {raw_net} 不是 "
                         f"{inv['currency']} 最小单位 {format(unit, 'f')} 的整数倍"
                     )
-                net = raw_net.quantize(unit)
+                net = quantize_money(raw_net, digits)
 
                 prev_net, prev_tax = prev_totals.get(line_no, (Decimal("0"), Decimal("0")))
                 cumulative_net = prev_net + net
@@ -1453,9 +1603,9 @@ def create_credit_memo(
                         f"未写入任何凭证"
                     )
 
-                cumulative_tax = (
-                    original_tax * cumulative_net / original_net
-                ).quantize(unit, rounding=ROUND_HALF_UP)
+                cumulative_tax = quantize_money(
+                    original_tax * cumulative_net / original_net, digits
+                )
                 if cumulative_net == original_net:
                     # 不变量保证：完全抵扣时恰好抵完原行已确认税额
                     cumulative_tax = original_tax
@@ -1585,11 +1735,8 @@ def credit_memo_overview(
     """
 
     memos = get_credit_memos(conn, int(invoice["id"]))
-    unit = _minor_unit(int(invoice["currency_digits"]))
+    digits = int(invoice["currency_digits"])
     credited = _credited_totals(conn, int(invoice["id"]))
-
-    credited_net = sum((net for net, _tax in credited.values()), Decimal("0"))
-    credited_tax = sum((tax for _net, tax in credited.values()), Decimal("0"))
 
     original_nets = {
         int(r["line_no"]): Decimal(r["net"])
@@ -1598,36 +1745,53 @@ def credit_memo_overview(
             (invoice["id"],),
         ).fetchall()
     }
-    line_credits: list[dict[str, Any]] = []
-    for line_no in sorted(credited):
-        net_total, tax_total = credited[line_no]
-        net_total = net_total.quantize(unit)
-        tax_total = tax_total.quantize(unit)
-        line_credits.append(
-            {
-                "line_no": line_no,
-                "credited_net": format(net_total, "f"),
-                "credited_tax": format(tax_total, "f"),
-                "credited_gross": format(net_total + tax_total, "f"),
-                "remaining_net": format(
-                    original_nets.get(line_no, Decimal("0")) - net_total, "f"
-                ),
-            }
-        )
+    money_inputs: list[Decimal] = [Decimal(invoice["total_net"]),
+                                   Decimal(invoice["total_tax"]),
+                                   Decimal(invoice["total_gross"])]
+    money_inputs.extend(original_nets.values())
+    for net, tax in credited.values():
+        money_inputs.extend((net, tax))
+    # 与其他金额累计同一精度策略（大额发票的逐原行累计/剩余净额）
+    with money_context(*money_inputs, extra_digits=digits):
+        credited_net = sum((net for net, _tax in credited.values()), Decimal("0"))
+        credited_tax = sum((tax for _net, tax in credited.values()), Decimal("0"))
 
-    return {
-        "invoice_id": int(invoice["id"]),
-        "currency": invoice["currency"],
-        "total_net": invoice["total_net"],
-        "total_tax": invoice["total_tax"],
-        "total_gross": invoice["total_gross"],
-        "credit_count": len(memos),
-        "credited_net": format(credited_net.quantize(unit), "f"),
-        "credited_tax": format(credited_tax.quantize(unit), "f"),
-        "credited_gross": format((credited_net + credited_tax).quantize(unit), "f"),
-        "line_credits": line_credits,
-        "memos": memos,
-    }
+        line_credits: list[dict[str, Any]] = []
+        for line_no in sorted(credited):
+            net_total, tax_total = credited[line_no]
+            net_total = quantize_money(net_total, digits)
+            tax_total = quantize_money(tax_total, digits)
+            line_credits.append(
+                {
+                    "line_no": line_no,
+                    "credited_net": format(net_total, "f"),
+                    "credited_tax": format(tax_total, "f"),
+                    "credited_gross": format(net_total + tax_total, "f"),
+                    "remaining_net": format(
+                        quantize_money(
+                            original_nets.get(line_no, Decimal("0")) - net_total,
+                            digits,
+                        ),
+                        "f",
+                    ),
+                }
+            )
+
+        credited_net = quantize_money(credited_net, digits)
+        credited_tax = quantize_money(credited_tax, digits)
+        return {
+            "invoice_id": int(invoice["id"]),
+            "currency": invoice["currency"],
+            "total_net": invoice["total_net"],
+            "total_tax": invoice["total_tax"],
+            "total_gross": invoice["total_gross"],
+            "credit_count": len(memos),
+            "credited_net": format(credited_net, "f"),
+            "credited_tax": format(credited_tax, "f"),
+            "credited_gross": format(credited_net + credited_tax, "f"),
+            "line_credits": line_credits,
+            "memos": memos,
+        }
 
 
 # ---- 应收账龄汇总 ----
@@ -1713,45 +1877,53 @@ def receivables_aging_summary(
                 key: Decimal("0") for key in AGING_BUCKET_KEYS
             }
 
-    for r in rows:
-        currency = r["currency"]
-        unit = _minor_unit(int(r["currency_digits"]))
-        gross = Decimal(r["total_gross"])
-        if gross <= 0:
-            continue
-        paid = paid_map.get(int(r["id"]), Decimal("0")).quantize(unit)
-        outstanding = (gross - paid).quantize(unit)
-        if outstanding <= 0:
-            continue
+    # 全币种统一精度上下文（按全部 gross 与净入账额的最大量级放大）：大额发票
+    # 的未收额在默认 28 位精度下会丢分位/抛异常，必须与快照/收款查询同口径
+    money_inputs = [Decimal(r["total_gross"]) for r in rows]
+    money_inputs.extend(paid_map.values())
+    with money_context(*money_inputs, extra_digits=4):
+        for r in rows:
+            currency = r["currency"]
+            digits = int(r["currency_digits"])
+            gross = Decimal(r["total_gross"])
+            if gross <= 0:
+                continue
+            paid = quantize_money(paid_map.get(int(r["id"]), Decimal("0")), digits)
+            outstanding = quantize_money(gross - paid, digits)
+            if outstanding <= 0:
+                continue
 
-        _ensure_currency(currency, int(r["currency_digits"]))
-        bucket = _aging_bucket(r["due_date"], as_of)
-        total_outstanding[currency] += outstanding
-        invoice_counts[currency] += 1
-        bucket_counts[currency][bucket] += 1
-        bucket_amounts[currency][bucket] += outstanding
+            _ensure_currency(currency, digits)
+            bucket = _aging_bucket(r["due_date"], as_of)
+            total_outstanding[currency] += outstanding
+            invoice_counts[currency] += 1
+            bucket_counts[currency][bucket] += 1
+            bucket_amounts[currency][bucket] += outstanding
 
-    currencies: list[dict[str, Any]] = []
-    for currency in sorted(digits_by_currency):
-        unit = _minor_unit(digits_by_currency[currency])
-        currencies.append(
-            {
-                "currency": currency,
-                "currency_digits": digits_by_currency[currency],
-                "invoice_count": invoice_counts[currency],
-                "total_outstanding": format(total_outstanding[currency].quantize(unit), "f"),
-                "buckets": [
-                    {
-                        "bucket": key,
-                        "invoice_count": bucket_counts[currency][key],
-                        "outstanding": format(
-                            bucket_amounts[currency][key].quantize(unit), "f"
-                        ),
-                    }
-                    for key in AGING_BUCKET_KEYS
-                ],
-            }
-        )
+        currencies: list[dict[str, Any]] = []
+        for currency in sorted(digits_by_currency):
+            cdigits = digits_by_currency[currency]
+            currencies.append(
+                {
+                    "currency": currency,
+                    "currency_digits": cdigits,
+                    "invoice_count": invoice_counts[currency],
+                    "total_outstanding": format(
+                        quantize_money(total_outstanding[currency], cdigits), "f"
+                    ),
+                    "buckets": [
+                        {
+                            "bucket": key,
+                            "invoice_count": bucket_counts[currency][key],
+                            "outstanding": format(
+                                quantize_money(bucket_amounts[currency][key], cdigits),
+                                "f",
+                            ),
+                        }
+                        for key in AGING_BUCKET_KEYS
+                    ],
+                }
+            )
 
     return {
         "as_of": as_of.isoformat(),
@@ -1830,55 +2002,62 @@ def tax_ledger_summary(
     # key=(币种, 规范税率文本) -> 累加器；金额逐行 Decimal 求和，不使用浮点聚合
     accum: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def _accumulate(rows: list[sqlite3.Row], side: str) -> None:
-        for r in rows:
-            currency = r["currency"]
-            digits = int(r["currency_digits"])
-            rate_value, rate_text = _normalize_tax_rate(r["tax_rate"])
-            key = (currency, rate_text)
-            bucket = accum.get(key)
-            if bucket is None:
-                bucket = {
-                    "currency": currency,
-                    "currency_digits": digits,
-                    "rate_value": rate_value,
-                    "invoiced": [Decimal("0"), Decimal("0"), Decimal("0")],
-                    "credited": [Decimal("0"), Decimal("0"), Decimal("0")],
+    # 累加与最终取整统一在按本期全部金额量级放大的局部精度内：大额发票（30 位
+    # 整数）的行金额在默认 28 位精度下相加会截断低位、quantize 会抛异常
+    all_amounts = [
+        Decimal(r[col]) for r in list(invoice_rows) + list(credit_rows)
+        for col in ("net", "tax", "gross")
+    ]
+    with money_context(*all_amounts, extra_digits=4):
+        def _accumulate(rows: list[sqlite3.Row], side: str) -> None:
+            for r in rows:
+                currency = r["currency"]
+                digits = int(r["currency_digits"])
+                rate_value, rate_text = _normalize_tax_rate(r["tax_rate"])
+                key = (currency, rate_text)
+                bucket = accum.get(key)
+                if bucket is None:
+                    bucket = {
+                        "currency": currency,
+                        "currency_digits": digits,
+                        "rate_value": rate_value,
+                        "invoiced": [Decimal("0"), Decimal("0"), Decimal("0")],
+                        "credited": [Decimal("0"), Decimal("0"), Decimal("0")],
+                    }
+                    accum[key] = bucket
+                amounts = bucket[side]
+                amounts[0] += Decimal(r["net"])
+                amounts[1] += Decimal(r["tax"])
+                amounts[2] += Decimal(r["gross"])
+
+        _accumulate(list(invoice_rows), "invoiced")
+        _accumulate(list(credit_rows), "credited")
+
+        groups: list[dict[str, Any]] = []
+        for key in sorted(accum, key=lambda k: (k[0], accum[k]["rate_value"])):
+            bucket = accum[key]
+            cdigits = bucket["currency_digits"]
+            invoiced = [quantize_money(v, cdigits) for v in bucket["invoiced"]]
+            credited = [quantize_money(v, cdigits) for v in bucket["credited"]]
+            net_amounts = [invoiced[i] - credited[i] for i in range(3)]
+
+            def _block(values: list[Decimal]) -> dict[str, str]:
+                return {
+                    "net": format(values[0], "f"),
+                    "tax": format(values[1], "f"),
+                    "gross": format(values[2], "f"),
                 }
-                accum[key] = bucket
-            amounts = bucket[side]
-            amounts[0] += Decimal(r["net"])
-            amounts[1] += Decimal(r["tax"])
-            amounts[2] += Decimal(r["gross"])
 
-    _accumulate(list(invoice_rows), "invoiced")
-    _accumulate(list(credit_rows), "credited")
-
-    groups: list[dict[str, Any]] = []
-    for key in sorted(accum, key=lambda k: (k[0], accum[k]["rate_value"])):
-        bucket = accum[key]
-        unit = _minor_unit(bucket["currency_digits"])
-        invoiced = [v.quantize(unit) for v in bucket["invoiced"]]
-        credited = [v.quantize(unit) for v in bucket["credited"]]
-        net_amounts = [invoiced[i] - credited[i] for i in range(3)]
-
-        def _block(values: list[Decimal]) -> dict[str, str]:
-            return {
-                "net": format(values[0], "f"),
-                "tax": format(values[1], "f"),
-                "gross": format(values[2], "f"),
-            }
-
-        groups.append(
-            {
-                "currency": bucket["currency"],
-                "currency_digits": bucket["currency_digits"],
-                "tax_rate": key[1],
-                "invoiced": _block(invoiced),
-                "credited": _block(credited),
-                "net": _block(net_amounts),
-            }
-        )
+            groups.append(
+                {
+                    "currency": bucket["currency"],
+                    "currency_digits": bucket["currency_digits"],
+                    "tax_rate": key[1],
+                    "invoiced": _block(invoiced),
+                    "credited": _block(credited),
+                    "net": _block(net_amounts),
+                }
+            )
 
     return {
         "start_date": start.isoformat(),

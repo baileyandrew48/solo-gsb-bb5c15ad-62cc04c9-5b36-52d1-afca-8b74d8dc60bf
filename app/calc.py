@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any, Iterable
@@ -38,14 +39,14 @@ from .currency import UnknownCurrencyError, currency_digits
 RULE_ID = "half_up_plus_largest_remainder_v1"
 
 # 局部精度下限：常规金额沿用历史精度 50 位；超大金额按输入量级自动放大
-# （见 _sufficient_prec）
+# （见 _sufficient_prec / money_context）
 _BASE_PREC = 50
 
 _ZERO = Decimal("0")
 _QUANT_CACHE: dict[int, Decimal] = {}
 
 
-def _unit(digits: int) -> Decimal:
+def minor_unit(digits: int) -> Decimal:
     """某币种的 1 个最小单位，例如 digits=2 -> Decimal('0.01')。"""
 
     if digits not in _QUANT_CACHE:
@@ -53,10 +54,76 @@ def _unit(digits: int) -> Decimal:
     return _QUANT_CACHE[digits]
 
 
-def _quantize(value: Decimal, digits: int) -> Decimal:
-    """按币种最小单位做 ROUND_HALF_UP 舍入。"""
+# 模块内简写
+_unit = minor_unit
 
-    return value.quantize(_unit(digits), rounding=ROUND_HALF_UP)
+
+def quantize_money(
+    value: Decimal, digits: int, rounding: str = ROUND_HALF_UP
+) -> Decimal:
+    """按币种最小单位舍入（默认 ROUND_HALF_UP），自带按输入量级给足的局部精度。
+
+    ``Decimal.quantize`` 要求结果系数位数不超过当前上下文精度，否则抛
+    ``InvalidOperation``：30 位整数发票的大额收款（如 33 位整数）量化到
+    ``0.01`` 需要约 35 位，FastAPI 工作线程默认的 28 位上下文必然失败。
+    因此这里不依赖调用方上下文，按 ``整数位数 + 币种小数位`` 自行放大，
+    任何线程下都精确、不抛异常。
+    """
+
+    if value.is_finite() and not value.is_zero():
+        int_digits = max(value.adjusted() + 1, 0)
+    else:
+        int_digits = 1
+    with localcontext() as ctx:
+        ctx.prec = max(_BASE_PREC, int_digits + digits + 4)
+        return value.quantize(minor_unit(digits), rounding=rounding)
+
+
+# 模块内简写
+_quantize = quantize_money
+
+
+def is_minor_unit_multiple(value: Decimal, unit: Decimal) -> bool:
+    """``value`` 是否为最小单位 ``unit`` 的整数倍。
+
+    在按输入量级给足精度的局部上下文中做除法与取整比较：默认 28 位精度会把
+    大额金额的小数位（如 26 位整数 + ``0.001``）在除法时舍没，从而把非最小
+    单位金额误判为合法。
+    """
+
+    with money_context(value, unit):
+        quotient = value / unit
+        return quotient == quotient.to_integral_value()
+
+
+@contextmanager
+def money_context(*values: Decimal, extra_digits: int = 0, products: int = 0):
+    """收款/余额类十进制运算的统一局部精度上下文。
+
+    与开票计算（``compute_invoice``）同一策略：**不读不写线程默认 Decimal
+    上下文**，按本次参与运算金额的实际量级放大精度——30 位整数 USD 发票的
+    含税总额有 33 位整数，默认 28 位精度下 ``总额 − 0.01`` 会丢掉分位、
+    大额 ``quantize`` 会抛 ``InvalidOperation``。任何线程（含 FastAPI 工作
+    线程）下结果一致。
+
+    * ``values``：本次运算涉及的金额，取其完整展开位数（span）上界；
+    * ``extra_digits``：结果额外的币种小数位需求（量化到最小单位）；
+    * ``products``：中间结果包含几项金额连乘（如贷项凭证税额摊算的
+      税额 × 累计净额 ÷ 原净额，取 1 即按 2 × span 给精度）。
+
+    加减/累加的中间和不超过各输入同号合计，规模不超过最大输入再加位数，
+    固定 16 位余量足以容纳行数进位；常规金额仍维持历史精度 50 位。
+    """
+
+    span = 1
+    for value in values:
+        if value is not None:
+            span = max(span, decimal_span(value))
+    with localcontext() as ctx:
+        ctx.prec = max(
+            _BASE_PREC, span * (products + 1) + 16 + 4 + extra_digits
+        )
+        yield ctx
 
 
 def to_decimal(value: Any, field: str) -> Decimal:
@@ -208,7 +275,7 @@ def _validate_lines(raw_lines: Iterable[Any]) -> list[tuple[str | None, Decimal,
     return result
 
 
-def _decimal_span(value: Decimal) -> int:
+def decimal_span(value: Decimal) -> int:
     """非零十进制数从最高整数位到最低小数位完整展开所需的位数。
 
     例如 100.00 -> 5、0.001 -> 3、1E+30 -> 31。用于估算局部精度上界。
@@ -219,6 +286,10 @@ def _decimal_span(value: Decimal) -> int:
     integer_digits = max(value.adjusted() + 1, 0)        # 整数部分位数（纯小数为 0）
     fraction_digits = max(-value.as_tuple().exponent, 0)  # 小数部分深度
     return integer_digits + fraction_digits
+
+
+# 模块内简写
+_decimal_span = decimal_span
 
 
 def _sufficient_prec(
